@@ -83,14 +83,17 @@ def main() -> int:
             if status == 0:
                 return 0
             failure = "".join(output)
+            busy_detach = bool(re.search(r'hdiutil: couldn.t eject "disk\d+" - Resource busy', failure))
+            busy_create = "hdiutil: create failed - Resource busy" in failure
             if (
                 attempt == 3
-                or not re.search(r'hdiutil: couldn.t eject "disk\d+" - Resource busy', failure)
+                or not (busy_detach or busy_create)
                 or "failed to bundle project: error running bundle_dmg.sh" not in failure
             ):
                 return status if status > 0 else 1
-            discard_busy_image(failure)
-            print("Discarded the busy temporary image; retrying packaging without recompilation.", flush=True)
+            if busy_detach:
+                discard_busy_image(failure)
+            print("Retrying busy DMG packaging without recompilation.", flush=True)
             time.sleep(5)
             command = [pnpm, "tauri", "bundle", "--ci", "--verbose"]
     return 1

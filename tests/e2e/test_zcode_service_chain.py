@@ -54,7 +54,12 @@ class DeterministicSourcePipeline:
         return GenerationResult(
             output=AtomicMemoryExtractionOutput(
                 candidates=tuple(
-                    AtomicMemoryCandidate(kind="fact", text=text, evidence_ids=(evidence.evidence_id,))
+                    AtomicMemoryCandidate(
+                        kind="fact",
+                        text=text,
+                        evidence_ids=(evidence.evidence_id,),
+                        description="Extracted fixture fact",
+                    )
                     for evidence in request.evidence
                     if (text := memory_source_text(evidence)) is not None
                 )
@@ -225,13 +230,27 @@ def _exercise_scope_bindings(
     assert binding_mutations[0][1]["key"] == binding_mutations[1][1]["key"]
 
 
+def _wait_for_processed_memory(client: httpx.Client, scope_id: str, text: str) -> dict[str, Any]:
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        response = client.post("/v1/memory/entries/list", json={"scope_id": scope_id})
+        response.raise_for_status()
+        items = response.json()["entries"]
+        assert all(entry["artifact"]["family"] == "atomic-memory" for entry in items)
+        generated = next((entry for entry in items if text in entry["text"]), None)
+        if generated is not None:
+            return generated
+        time.sleep(0.05)
+    pytest.fail("The original flush must commit the captured source")
+
+
 @pytest.mark.parametrize(
-    ("processing_delay", "binding_delay"),
-    [(0, 0), (1.2, 0), (0, 1.2)],
-    ids=["fast", "beyond-stop-budget", "late-binding-replies"],
+    ("processing_delay", "binding_delay", "slow_flush_receipt"),
+    [(0, 0, False), (1.2, 0, False), (0, 1.2, False), (0, 0, True)],
+    ids=["fast", "beyond-stop-budget", "late-binding-replies", "late-flush-receipt"],
 )
 def test_zcode_source_is_processed_and_recalled_in_a_new_session(
-    tmp_path: Path, monkeypatch, processing_delay: float, binding_delay: float
+    tmp_path: Path, monkeypatch, processing_delay: float, binding_delay: float, slow_flush_receipt: bool
 ) -> None:
     monkeypatch.setenv("ZCODE_PLUGIN_DATA", str(tmp_path / "plugin-data"))
     node = shutil.which("node")
@@ -244,6 +263,21 @@ def test_zcode_source_is_processed_and_recalled_in_a_new_session(
         candidate_pipeline=atomic_memory_pipeline(DeterministicSourcePipeline(processing_delay)),
     )
     binding_mutations = _observe_binding_replies(app, binding_delay)
+    flush_requests = 0
+
+    @app.middleware("http")
+    async def observe_flush(request, call_next):
+        nonlocal flush_requests
+        is_flush = request.url.path == "/v1/memory/flush"
+        if is_flush:
+            flush_requests += 1
+        response = await call_next(request)
+        if is_flush and slow_flush_receipt:
+            # Processing commits in the real Server, but the response arrives
+            # after Stop's fixed 800 ms request budget.
+            await asyncio.sleep(1.2)
+        return response
+
     with socket.socket() as socket_probe:
         socket_probe.bind(("127.0.0.1", 0))
         port = socket_probe.getsockname()[1]
@@ -286,19 +320,21 @@ def test_zcode_source_is_processed_and_recalled_in_a_new_session(
             remaining = 5 - time.time() % 5
             if remaining < 1.5:
                 time.sleep(remaining + 0.05)
+            stop_input = json.dumps({
+                "hookEventName": "Stop",
+                "cwd": str(HOOK.parents[5]),
+                "sessionId": "old-session",
+                "stopHookActive": False,
+            })
+            stop_environment = {
+                **environment,
+                "POWERCONTEXT_ZCODE_SCOPE_ID": scope_id,
+                "POWERCONTEXT_ZCODE_BOUNDARY_FLUSH": "true",
+            }
             stopped = subprocess.run(
                 [node, str(HOOK.parent / "stop.mjs")],
-                input=json.dumps({
-                    "hookEventName": "Stop",
-                    "cwd": str(HOOK.parents[5]),
-                    "sessionId": "old-session",
-                    "stopHookActive": False,
-                }),
-                env={
-                    **environment,
-                    "POWERCONTEXT_ZCODE_SCOPE_ID": scope_id,
-                    "POWERCONTEXT_ZCODE_BOUNDARY_FLUSH": "true",
-                },
+                input=stop_input,
+                env=stop_environment,
                 text=True,
                 capture_output=True,
                 check=False,
@@ -330,7 +366,7 @@ def test_zcode_source_is_processed_and_recalled_in_a_new_session(
             flush = result["observation"]["stages"]["flush"]
             assert result["observation"]["config"]["request_timeout_ms"] == 800
             assert result["observation"]["config"]["hook_budget_ms"] == 1000
-            if processing_delay:
+            if processing_delay or slow_flush_receipt:
                 assert flush["state"] == "unknown", result
             if flush["state"] == "unknown":
                 # The bounded Stop can time out while real Server processing continues.
@@ -346,21 +382,24 @@ def test_zcode_source_is_processed_and_recalled_in_a_new_session(
                         "unknown_flush_paused": True,
                     }
                 ], result
+                retried = subprocess.run(
+                    stopped.args,
+                    input=stop_input,
+                    env=stop_environment,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=2,
+                )
+                assert retried.returncode == 0 and json.loads(retried.stdout) == {}, retried.stderr
+                assert "unknown_flush_paused" in retried.stderr
             else:
                 assert flush["state"] == "cursor_reached", result
                 assert flush["current_cursor"] >= flush["source_position"]
                 assert result["pending"]["scopes"] == []
-            # Server completion has its own budget, independent of the host Hook deadline.
-            deadline = time.monotonic() + 15
-            while True:
-                entries = client.post("/v1/memory/entries/list", json={"scope_id": scope_id})
-                entries.raise_for_status()
-                generated = next((entry for entry in entries.json()["entries"] if "teal-731" in entry["text"]), None)
-                if generated is not None:
-                    break
-                assert time.monotonic() < deadline, entries.json()
-                time.sleep(0.05)
-            assert all(entry["artifact"]["family"] == "atomic-memory" for entry in entries.json()["entries"])
+            # Observe real processing independently; never replay an unknown mutation.
+            generated = _wait_for_processed_memory(client, scope_id, "teal-731")
+            assert flush_requests == 1, "An unknown Stop must never replay its mutation automatically"
             captured = client.get(f"/v1/scopes/{scope_id}/sources").json()["items"]
             reference = generated["artifact"]
             revision = client.get(

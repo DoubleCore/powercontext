@@ -60,3 +60,14 @@ def test_local_setup_catalog_digest_matches_the_ops_model(tmp_path: Path) -> Non
     resource = ResourceCatalog.read(catalog, hashlib.sha256(content).hexdigest()).resources[0]
     assert resource.files[-1].executable is False
     assert resource.digest == "1a41e4f4b604815d6b6ed2a76679786a1f5795aed2549542aeeb643094f12c7e"
+
+
+def test_bundled_desktop_contract_has_a_qualified_business_profile() -> None:
+    native = REPOSITORY_ROOT / "desktop/src-tauri/src"
+    contract = json.loads((native / "transport/operations.json").read_text(encoding="utf-8"))
+    profiles = json.loads((native / "connections/compatibility.json").read_text(encoding="utf-8"))
+    required = {"remember_memory", "search_memory", "get_artifact_revision"}
+    assert any(
+        profile["contractSha256"] == contract["contractSha256"] and required <= set(profile["operations"])
+        for profile in profiles
+    ), "The bundled Desktop contract has no qualified profile for save, search and exact reads."

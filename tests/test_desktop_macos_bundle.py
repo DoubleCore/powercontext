@@ -43,12 +43,16 @@ if case == "foreign":
 if Path(sys.argv[0]).name == "pnpm":
     if sys.argv[2] == "bundle":
         assert not image.exists(), "stale image would be included in the next DMG"
-        if case == "recover":
+        if case in {"recover", "create"}:
             print("Finished DMG packaging")
             sys.exit(0)
     if case == "compiler":
         print("error: could not compile application")
         sys.exit(23)
+    if case == "create":
+        print("hdiutil: create failed - Resource busy")
+        print("failed to bundle project: error running bundle_dmg.sh")
+        sys.exit(1)
     image.parent.mkdir(parents=True, exist_ok=True)
     image.write_bytes(b"disposable raw image")
     print("created: " + str(image))
@@ -66,7 +70,7 @@ else:
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="macOS packaging uses POSIX executables")
-@pytest.mark.parametrize("case", ["recover", "compiler", "persistent", "foreign"])
+@pytest.mark.parametrize("case", ["recover", "create", "compiler", "persistent", "foreign"])
 def test_macos_packaging_recovery(tmp_path: Path, case: str) -> None:
     desktop = tmp_path / "desktop"
     scripts = desktop / "scripts"
@@ -91,10 +95,10 @@ def test_macos_packaging_recovery(tmp_path: Path, case: str) -> None:
     packages = [call[2] for call in calls if call[0] == "pnpm"]
     detach = [call for call in calls if call[0:2] == ["hdiutil", "detach"]]
     log = (desktop / ".artifacts/macos-build.log").read_text()
-    if case == "recover":
+    if case in {"recover", "create"}:
         assert result.returncode == 0, result.stderr
         assert packages == ["build", "bundle"]
-        assert detach == [["hdiutil", "detach", "-force", "/dev/disk2"]]
+        assert detach == ([["hdiutil", "detach", "-force", "/dev/disk2"]] if case == "recover" else [])
         assert "Resource busy" in log and "Finished DMG packaging" in log
     elif case == "compiler":
         assert result.returncode == 23

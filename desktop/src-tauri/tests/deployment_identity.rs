@@ -39,6 +39,8 @@ struct State {
     principal: Option<String>,
     pause: Option<String>,
     requests: Vec<String>,
+    lose_write_response: bool,
+    reject_write: bool,
 }
 struct Fixture {
     manager: Arc<ConnectionManager>,
@@ -83,6 +85,8 @@ impl Fixture {
             principal: authenticated.then(|| "same-principal".into()),
             pause: None,
             requests: vec![],
+            lose_write_response: false,
+            reject_write: false,
         }));
         let started = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
@@ -121,7 +125,7 @@ impl Fixture {
                         .nth(1)
                         .unwrap()
                         .to_owned();
-                    let (status, value, pause) = {
+                    let (status, value, pause, lose_response) = {
                         let mut state = responses.lock().unwrap();
                         state.requests.push(path.clone());
                         let (status, value) = match path.as_str() {
@@ -150,6 +154,9 @@ impl Fixture {
                                 200,
                                 json!({"mode":"text","hits":[{"memory":record(),"score":1,"matched_by":["text"]}]}),
                             ),
+                            "/v1/memory/remember" if state.reject_write => {
+                                (403, json!({"error":{"code":"forbidden"}}))
+                            }
                             "/v1/memory/remember" => {
                                 (200, json!({"changed":true,"records":[record()]}))
                             }
@@ -169,11 +176,15 @@ impl Fixture {
                                 .pause
                                 .as_ref()
                                 .is_some_and(|prefix| path.starts_with(prefix)),
+                            path == "/v1/memory/remember" && state.lose_write_response,
                         )
                     };
                     if pause {
                         entered.notify_one();
                         resume.notified().await;
+                    }
+                    if lose_response {
+                        return;
                     }
                     let body = value.to_string();
                     let response = format!(
@@ -583,6 +594,157 @@ async fn post_write_discovery_503_disconnects_with_an_unknown_original_receipt()
             .unwrap()
             .operation_id,
         outcome.record.operation_id
+    );
+}
+
+#[tokio::test]
+async fn retry_discovery_failure_preserves_the_original_unknown_receipt_without_dispatch() {
+    let fixture = Fixture::new(true).await;
+    let generation = fixture.select().await;
+    fixture.state.lock().unwrap().lose_write_response = true;
+    let original = fixture
+        .manager
+        .remember(generation, "original uncertain input")
+        .await
+        .unwrap();
+    assert_eq!(original.record.status, WriteStatus::Unknown);
+    assert!(fixture.manager.state().unwrap().active.is_some());
+    fixture.state.lock().unwrap().discovery = (503, json!({"error":{"code":"runtime_not_ready"}}));
+    let error = fixture
+        .manager
+        .remember(generation, "edited retry input")
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.code, SafeError::RuntimeNotReady);
+    fixture.assert_disconnected(generation);
+    let retained = fixture.manager.state().unwrap().last_write.unwrap();
+    assert_eq!(retained.operation_id, original.record.operation_id);
+    assert_eq!(retained.status, WriteStatus::Unknown);
+    assert_eq!(
+        fixture
+            .state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|path| *path == "/v1/memory/remember")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn concurrent_read_disconnect_keeps_the_pending_write_until_its_unknown_receipt() {
+    let fixture = Fixture::new(true).await;
+    let generation = fixture.select().await;
+    fixture.state.lock().unwrap().pause = Some("/v1/memory/remember".into());
+    let manager = fixture.manager.clone();
+    let write = tokio::spawn(async move {
+        manager
+            .remember(generation, "in-flight original input")
+            .await
+    });
+    fixture.entered().await;
+    fixture.state.lock().unwrap().discovery = (503, json!({"error":{"code":"runtime_not_ready"}}));
+    let error = fixture
+        .manager
+        .search_memory(generation, "query")
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.code, SafeError::RuntimeNotReady);
+    fixture.assert_disconnected(generation);
+    let pending = fixture.manager.state().unwrap().last_write.unwrap();
+    assert_eq!(pending.status, WriteStatus::Pending);
+    fixture.release.notify_one();
+    let result = timeout(Duration::from_secs(5), write)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.record.status, WriteStatus::Unknown);
+    assert_eq!(result.record.operation_id, pending.operation_id);
+    assert!(result.result.is_none());
+    assert_eq!(
+        fixture
+            .manager
+            .state()
+            .unwrap()
+            .last_write
+            .unwrap()
+            .operation_id,
+        pending.operation_id
+    );
+    assert_eq!(
+        fixture
+            .state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|path| *path == "/v1/memory/remember")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn rejected_write_after_read_disconnection_retains_its_failed_original_receipt() {
+    let fixture = Fixture::new(true).await;
+    let generation = fixture.select().await;
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.pause = Some("/v1/memory/remember".into());
+        state.reject_write = true;
+    }
+    let manager = fixture.manager.clone();
+    let write = tokio::spawn(async move {
+        manager
+            .remember(generation, "rejected original input")
+            .await
+    });
+    fixture.entered().await;
+    fixture.state.lock().unwrap().discovery = (503, json!({"error":{"code":"runtime_not_ready"}}));
+    assert!(
+        fixture
+            .manager
+            .search_memory(generation, "query")
+            .await
+            .is_err()
+    );
+    fixture.assert_disconnected(generation);
+    let pending = fixture.manager.state().unwrap().last_write.unwrap();
+    assert_eq!(pending.status, WriteStatus::Pending);
+    fixture.release.notify_one();
+    let result = timeout(Duration::from_secs(5), write)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.record.status, WriteStatus::Failed);
+    assert_eq!(
+        result.record.error.as_ref().unwrap().code,
+        SafeError::Forbidden
+    );
+    assert_eq!(result.record.operation_id, pending.operation_id);
+    assert_eq!(result.record.context.server_id.as_deref(), Some("server-a"));
+    assert_eq!(result.record.context.scope_id, "scope-a");
+    assert!(result.result.is_none());
+    assert!(result.record.references.is_empty());
+    let retained = fixture.manager.state().unwrap().last_write.unwrap();
+    assert_eq!(retained.operation_id, pending.operation_id);
+    assert_eq!(retained.status, WriteStatus::Failed);
+    assert_eq!(
+        fixture
+            .state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|path| *path == "/v1/memory/remember")
+            .count(),
+        1
     );
 }
 

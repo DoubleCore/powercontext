@@ -64,6 +64,7 @@ export function App() {
   const [menu, setMenu] = useState(false);
   const [host, setHost] = useState<FoundationInfo | null>(null);
   const [desktop, setDesktop] = useState<DesktopState | null>(null);
+  const currentState = useRef<DesktopState | null>(null);
   const [nativeError, setNativeError] = useState<unknown>(null);
   const [stateError, setStateError] = useState<unknown>(null);
   const [stateLoading, setStateLoading] = useState(true);
@@ -100,6 +101,7 @@ export function App() {
       );
     };
   }
+  const [connectionDraftReset, setConnectionDraftReset] = useState(0);
   const [scopeOpen, setScopeOpen] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [connectionSelection, setConnectionSelection] = useState<{
@@ -117,10 +119,13 @@ export function App() {
     // Pending operations may finish after their editor has unmounted.
     setPendingConnections((current) => current + (pending ? 1 : -1));
   }
-  const acceptedGeneration = useRef(-1);
   function receiveState(next: DesktopState) {
-    if (next.generation < acceptedGeneration.current) return false;
-    acceptedGeneration.current = next.generation;
+    if (
+      currentState.current &&
+      next.generation < currentState.current.generation
+    )
+      return false;
+    currentState.current = next;
     setDesktop(next);
     return true;
   }
@@ -146,6 +151,7 @@ export function App() {
   const localServerHeading = useRef<HTMLHeadingElement>(null);
   const settingsSection = useRef<"local-server" | undefined>(undefined);
   const scopeReturnFocus = useRef<HTMLElement | null>(null);
+  const scopeToMemory = useRef(false);
   const t = messages[language];
   const ct = connectionMessages[language];
   async function loadState() {
@@ -179,9 +185,10 @@ export function App() {
     target?.focus();
     if (localServer) target?.scrollIntoView?.({ block: "start" });
   }, [page, connectionSelection]);
-  function openScopes(trigger: HTMLElement) {
+  function openScopes(trigger: HTMLElement, toMemory = false) {
     uiIntent.current++;
     scopeReturnFocus.current = trigger;
+    scopeToMemory.current = toMemory;
     setScopeOpen(true);
   }
   async function navigate(
@@ -435,6 +442,8 @@ export function App() {
               onState={receiveState}
               onDirty={editorDirty}
               onPendingChange={connectionPending}
+              onActivated={(trigger) => openScopes(trigger, true)}
+              discardDraft={connectionDraftReset}
             />
           )}
           {page === "observation" && (
@@ -574,8 +583,14 @@ export function App() {
             onPendingChange={scopePending}
             onSelectionError={setNativeError}
             onSelected={() => {
+              if (page === "connections" && dirty)
+                setConnectionDraftReset((current) => current + 1);
               setDirty(false);
               setScopeOpen(false);
+              if (scopeToMemory.current) {
+                scopeReturnFocus.current = null;
+                setPage("memories");
+              }
             }}
             hideHeading
             onManageConnections={() => {
