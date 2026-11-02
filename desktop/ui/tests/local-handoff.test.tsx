@@ -28,11 +28,13 @@ import { App } from "../src/app/App";
 import { answerConfirmation } from "./confirmation";
 import { opsApi } from "../src/shared/ops";
 import { desktopApi } from "../src/shared/ipc";
+import { localText } from "../src/app/local-server-messages";
 import type { DesktopState } from "../src/generated/ipc";
 vi.mock("../src/shared/ipc", () => ({
   getFoundationInfo: vi.fn().mockResolvedValue(null),
   desktopApi: {
     state: vi.fn(),
+    invalidate: vi.fn(),
     cancelMemory: vi.fn().mockResolvedValue(undefined),
   },
 }));
@@ -42,6 +44,7 @@ vi.mock("../src/shared/ops", () => ({
     inspect: vi.fn(),
     references: vi.fn(),
     connect: vi.fn(),
+    preflight: vi.fn(),
     apply: vi.fn(),
   },
 }));
@@ -313,3 +316,83 @@ test("a late local handoff respects navigation even without a new draft", async 
   await act(async () => finish(connected()));
   expect(screen.getByRole("heading", { level: 1, name: "总览" })).toBeTruthy();
 });
+
+test.each(["zh", "en"] as const)(
+  "local invalidation preserves a newer connection draft and its discard guard (%s)",
+  async (language) => {
+    const user = userEvent.setup();
+    const t = (key: string) => localText(language, key);
+    let finish!: (state: DesktopState) => void;
+    vi.mocked(desktopApi.state).mockResolvedValue(connected());
+    vi.mocked(desktopApi.invalidate).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    vi.mocked(opsApi.preflight).mockResolvedValue({
+      outcome: "succeeded",
+      approval: {
+        approvalId: "approval-a",
+        planId: "plan-a",
+        operation: "repair",
+        options: {},
+        target: {
+          targetId: "personal",
+          packageVersion: "1.4.2",
+          pythonExecutable: "/program/runtime/python",
+          envFile: "/config/server.env",
+          dataDir: "/data/personal",
+          endpoint: "http://127.0.0.1:8123",
+          startOnLogin: true,
+        },
+        effects: { mayStart: true, preservesData: true },
+      },
+    });
+    render(<App />);
+    await screen.findAllByText("Local Server");
+    await user.click(screen.getByRole("button", { name: "设置与诊断" }));
+    await user.selectOptions(screen.getByLabelText("语言"), language);
+    await user.click(screen.getByRole("button", { name: t("repair") }));
+    const plan = await screen.findByRole("dialog", { name: t("plan") });
+    await user.click(within(plan).getByRole("button", { name: t("approve") }));
+    await waitFor(() =>
+      expect(desktopApi.invalidate).toHaveBeenCalledWith("local-profile"),
+    );
+    await user.click(within(plan).getByRole("button", { name: t("dismiss") }));
+    await user.click(
+      screen.getByRole("button", {
+        name: language === "en" ? "Connections" : "连接",
+      }),
+    );
+    const input = screen.getByRole("textbox", {
+      name: language === "en" ? "Connection name" : "连接名称",
+    });
+    await user.type(input, "new unsaved profile");
+    await act(async () =>
+      finish({ ...connected(), generation: 7, active: null }),
+    );
+    expect((input as HTMLInputElement).value).toBe("new unsaved profile");
+    expect(screen.queryByText("server-returned-default")).toBeNull();
+    expect(opsApi.apply).not.toHaveBeenCalled();
+    await user.click(
+      screen.getByRole("button", {
+        name: language === "en" ? "Overview" : "总览",
+      }),
+    );
+    await answerConfirmation(user, false);
+    expect((input as HTMLInputElement).value).toBe("new unsaved profile");
+    await user.click(
+      screen.getByRole("button", {
+        name: language === "en" ? "Overview" : "总览",
+      }),
+    );
+    await answerConfirmation(user, true);
+    expect(
+      screen.getByRole("heading", {
+        level: 1,
+        name: language === "en" ? "Overview" : "总览",
+      }),
+    ).toBeTruthy();
+  },
+);

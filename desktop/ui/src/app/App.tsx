@@ -478,6 +478,7 @@ export function App() {
                   !!desktop && !stateLoading && !contextPending
                 }
                 onBeforeApply={async (plan) => {
+                  const intent = uiIntent.current;
                   if (
                     activeProfile &&
                     plan.target.endpoint &&
@@ -489,7 +490,7 @@ export function App() {
                       receiveState(
                         await desktopApi.invalidate(activeProfile.id),
                       );
-                      setDirty(false);
+                      if (intent === uiIntent.current) setDirty(false);
                     } catch (error) {
                       setNativeError(error);
                       return false;
